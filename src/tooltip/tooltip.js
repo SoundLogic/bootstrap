@@ -15,6 +15,11 @@ angular.module( 'ui.bootstrap.tooltip', [ 'ui.bootstrap.position', 'ui.bootstrap
     placement: 'top',
     animation: true,
     popupDelay: 0,
+    ignoreTriggers: false,
+    /**
+     * useContentExp options allows for trusted resource URLs through Strict Contextual Escaping ($sce) -
+     * If an interpolated expression is used instead, then the benefits of SCE is lost.
+     */
     useContentExp: false
   };
 
@@ -65,7 +70,8 @@ angular.module( 'ui.bootstrap.tooltip', [ 'ui.bootstrap.position', 'ui.bootstrap
    * Returns the actual instance of the $tooltip service.
    * TODO support multiple triggers
    */
-  this.$get = [ '$window', '$compile', '$timeout', '$document', '$position', '$interpolate', function ( $window, $compile, $timeout, $document, $position, $interpolate ) {
+  this.$get = [ '$window', '$compile', '$timeout', '$document', '$position', '$interpolate'
+    , function ( $window, $compile, $timeout, $document, $position, $interpolate ) {
     return function $tooltip ( type, prefix, defaultTriggerShow, options ) {
       options = angular.extend( {}, defaultOptions, globalOptions, options );
 
@@ -82,11 +88,16 @@ angular.module( 'ui.bootstrap.tooltip', [ 'ui.bootstrap.position', 'ui.bootstrap
        * mapped trigger from `triggerMap` or the passed trigger if the map is
        * undefined; otherwise, it uses the `triggerMap` value of the show
        * trigger; else it will just use the show trigger.
+       *
+       * the ignore trigger option should be passed when the tooltip caller
+       * has defined its own triggers
        */
       function getTriggers ( trigger ) {
+        var ignore = options.ignoreTriggers;
         var show = trigger || options.trigger || defaultTriggerShow;
         var hide = triggerMap[show] || show;
         return {
+          ignore: ignore,
           show: show,
           hide: hide
         };
@@ -110,8 +121,11 @@ angular.module( 'ui.bootstrap.tooltip', [ 'ui.bootstrap.position', 'ui.bootstrap
           '>'+
         '</div>';
 
+      var fn = {};
+
       return {
         restrict: 'EA',
+        fn: fn,
         compile: function (tElem, tAttrs) {
           var tooltipLinker = $compile( template );
 
@@ -176,6 +190,9 @@ angular.module( 'ui.bootstrap.tooltip', [ 'ui.bootstrap.position', 'ui.bootstrap
                 hide();
               });
             }
+
+            fn.show = showTooltipBind;
+            fn.hide = hideTooltipBind;
 
             // Show the tooltip popup element.
             function show() {
@@ -330,13 +347,16 @@ angular.module( 'ui.bootstrap.tooltip', [ 'ui.bootstrap.position', 'ui.bootstrap
 
               triggers = getTriggers( val );
 
-              if ( triggers.show === triggers.hide ) {
+              if(triggers.ignore){
+                return;
+              } else if ( triggers.show === triggers.hide ) {
                 element.bind( triggers.show, toggleTooltipBind );
               } else {
                 element.bind( triggers.show, showTooltipBind );
                 element.bind( triggers.hide, hideTooltipBind );
               }
             }
+
             prepTriggers();
 
             var animation = scope.$eval(attrs[prefix + 'Animation']);
@@ -350,10 +370,10 @@ angular.module( 'ui.bootstrap.tooltip', [ 'ui.bootstrap.position', 'ui.bootstrap
             // by the change.
             if ( appendToBody ) {
               scope.$on('$locationChangeSuccess', function closeTooltipOnLocationChangeSuccess () {
-              if ( ttScope.isOpen ) {
-                hide();
-              }
-            });
+                if ( ttScope.isOpen ) {
+                  hide();
+                }
+              });
             }
 
             // Make sure tooltip is destroyed and removed.
@@ -369,6 +389,176 @@ angular.module( 'ui.bootstrap.tooltip', [ 'ui.bootstrap.position', 'ui.bootstrap
       };
     };
   }];
+})
+
+.provider('$tooltipEx', function () {
+  var provider = {
+    openedTooltip: (function() {
+      var instanceCtx;
+      return {
+        get: get,
+        set: set,
+        isSet: isSet,
+        clear: clear
+      };
+
+      function get(){ return instanceCtx; }
+      function set(instanceContext){ instanceCtx = instanceContext; }
+      function isSet(){ return instanceCtx != undefined; }
+      function clear(){ instanceCtx = undefined; }
+    })(),
+    options: {
+      placement: 'left'
+    },
+    $get: ['$injector', '$rootScope', '$q', '$http', '$templateCache', '$controller',
+      function ($injector, $rootScope, $q, $http, $templateCache, $controller) {
+
+        var $tooltipEx = {};
+
+        function getTemplatePromise(options) {
+          return options.template
+            ? $q.when(options.template)
+            : $http.get(angular.isFunction(options.templateUrl) ? (options.templateUrl)() : options.templateUrl, { cache: $templateCache })
+              .then(function (result) { return result.data; });
+        }
+
+        function getResolvePromises(resolves) {
+          var promisesArr = [];
+          angular.forEach(resolves, function (value) {
+            if (angular.isFunction(value) || angular.isArray(value)) {
+              promisesArr.push($q.when($injector.invoke(value)));
+            }
+          });
+
+          return promisesArr;
+        }
+
+        $tooltipEx.open = function (tooltipOptions) {
+          var tooltipResultDeferred = $q.defer();
+          var tooltipOpenedDeferred = $q.defer();
+
+          //prepare an instance of a tooltip to be injected into controllers and returned to a caller
+          var tooltipInstance = {
+            result: tooltipResultDeferred.promise,
+            opened: tooltipOpenedDeferred.promise,
+            close: function (result) {
+              var tooltip = provider.openedTooltip.get();
+              if(tooltip) {
+                tooltip.deferred.resolve(result);
+                provider.openedTooltip.clear();
+              }
+            },
+            dismiss: function (reason) {
+              var tooltip = provider.openedTooltip.get();
+              if(tooltip) {
+                tooltip.deferred.reject(reason);
+                provider.openedTooltip.clear();
+              }
+            }
+          };
+
+          // TODO: verify this will work - may need to defer this
+          if(provider.openedTooltip.isSet()){
+            //TODO: provide option to close existing tooltip
+            tooltipResultDeferred.reject("another tooltip is already open");
+            return tooltipInstance;
+          }
+
+          //merge and clean up options
+          tooltipOptions = angular.extend({}, provider.options, tooltipOptions);
+          tooltipOptions.resolve = tooltipOptions.resolve || {};
+
+          //verify options
+          var noTemplateProvided = !tooltipOptions.template && !tooltipOptions.templateUrl;
+          if (noTemplateProvided || !tooltipOptions.targetElement) {
+            throw new Error('One of template or templateUrl options is required.');
+          }
+
+          var templateAndResolvePromise =
+            $q.all([getTemplatePromise(tooltipOptions)].concat(getResolvePromises(tooltipOptions.resolve)));
+
+
+          templateAndResolvePromise.then(function resolveSuccess(tplAndVars) {
+            //TODO: does it still make sense to create the $scope and controller here?
+            var tooltipScope = (tooltipOptions.scope || $rootScope).$new(true);
+            tooltipScope.$close = tooltipInstance.close;
+            tooltipScope.$dismiss = tooltipInstance.dismiss;
+
+            var ctrlInstance, ctrlLocals = {};
+            var resolveIter = 1;
+
+            //controllers
+            if (tooltipOptions.controller) {
+              ctrlLocals.$scope = tooltipScope;
+              ctrlLocals.tooltipInstance = tooltipInstance;
+              angular.forEach(tooltipOptions.resolve, function (value, key) {
+                ctrlLocals[key] = tplAndVars[resolveIter++];
+              });
+
+              ctrlInstance = $controller(tooltipOptions.controller, ctrlLocals);
+              if (tooltipOptions.controllerAs) {
+                tooltipScope[tooltipOptions.controllerAs] = ctrlInstance;
+              }
+            }
+
+            var tooltip = {
+              scope: tooltipScope,
+              deferred: tooltipResultDeferred,
+              content: tplAndVars[0],
+              keyboard: tooltipOptions.keyboard,
+              placement: tooltipOptions.placement,
+              tooltipClass: tooltipOptions.tooltipClass,
+              tooltipTemplateUrl: tooltipOptions.templateUrl,
+              targetElement: tooltipOptions.targetElement,
+              ignoreTriggers: true
+            };
+
+            provider.openedTooltip.set({
+              deferred: tooltip.deferred,
+              tooltipScope: tooltip.scope,
+              keyboard: tooltip.keyboard,
+              placement: tooltip.placement,
+              targetElement: tooltip.targetElement
+            });
+            /*tooltipStack.open(tooltipInstance, {
+              scope: tooltipScope,
+              deferred: tooltipResultDeferred,
+              content: tplAndVars[0],
+              keyboard: tooltipOptions.keyboard,
+              placement: tooltipOptions.placement,
+              targetElement: tooltipOptions.targetElement,
+              tooltipClass: tooltipOptions.tooltipClass,
+              tooltipTemplateUrl: tooltipOptions.templateUrl
+            });*/
+
+          }, function resolveError(reason) {
+            tooltipResultDeferred.reject(reason);
+            provider.openedTooltip.clear();
+          });
+
+          templateAndResolvePromise.then(function () {
+            tooltipOpenedDeferred.resolve(true);
+          }, function () {
+            //TODO: provider.openedTooltip.clear(); ?
+            tooltipOpenedDeferred.reject(false);
+          });
+
+          return tooltipInstance;
+        };
+
+        $tooltipEx.close = function(tooltipInstance){
+
+        };
+
+        $tooltipEx.dismiss = function(tooltipInstance){
+
+        };
+
+        return $tooltipEx;
+      }]
+  }
+
+  return provider;
 })
 
 // This is mostly ngInclude code but with a custom scope
@@ -471,7 +661,7 @@ function ($animate ,  $sce ,  $compile ,  $templateRequest) {
 })
 
 .directive( 'tooltip', [ '$tooltip', function ( $tooltip ) {
-  return $tooltip( 'tooltip', 'tooltip', 'mouseenter' );
+  return $tooltip( 'tooltip', 'tooltip', 'mouseenter');
 }])
 
 .directive( 'tooltipTemplatePopup', function () {
